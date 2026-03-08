@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+env/
+venv/
+*.env
+
+# DuckDB
+database/f1_data.duckdb
+
+# FastF1 cache
+python/cache/
+
+# OS files
+.DS_Store
+Thumbs.db
