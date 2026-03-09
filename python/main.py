@@ -3,10 +3,12 @@ import pandas as pd
 import duckdb
 import os
 import datetime
+import time
 
 # ----------------------
-# Paths and cache
+# Paths
 # ----------------------
+
 db_dir = os.path.join("..", "database")
 os.makedirs(db_dir, exist_ok=True)
 db_path = os.path.join(db_dir, "f1_data.duckdb")
@@ -15,28 +17,34 @@ cache_dir = "cache"
 os.makedirs(cache_dir, exist_ok=True)
 fastf1.Cache.enable_cache(cache_dir)
 
-# ----------------------
-# Season settings
-# ----------------------
 SEASONS = [2025, 2026]
-SESSION_TYPE = "R"
-
-today = datetime.datetime.utcnow()
+today = datetime.datetime.now(datetime.UTC)
 
 # ----------------------
-# Connect to DuckDB
+# Connect DB
 # ----------------------
+
 con = duckdb.connect(db_path)
+
 print("Connecting to DuckDB...")
 print("DB PATH:", os.path.abspath(db_path))
 
 # ----------------------
-# Create tables
+# TABLES
 # ----------------------
+
 con.execute("""
 CREATE TABLE IF NOT EXISTS drivers(
 driverId VARCHAR,
-driver VARCHAR,
+driver VARCHAR
+)
+""")
+
+con.execute("""
+CREATE TABLE IF NOT EXISTS driver_races(
+raceId VARCHAR,
+driverId VARCHAR,
+driver_number INTEGER,
 team VARCHAR
 )
 """)
@@ -46,7 +54,17 @@ CREATE TABLE IF NOT EXISTS races(
 raceId VARCHAR,
 season INTEGER,
 round INTEGER,
-circuit VARCHAR
+gp_name VARCHAR,
+location VARCHAR,
+country VARCHAR
+)
+""")
+
+con.execute("""
+CREATE TABLE IF NOT EXISTS sectors(
+raceId VARCHAR,
+sector INTEGER,
+start_distance DOUBLE
 )
 """)
 
@@ -84,6 +102,7 @@ con.execute("""
 CREATE TABLE IF NOT EXISTS telemetry(
 raceId VARCHAR,
 driverId VARCHAR,
+time DOUBLE,
 distance DOUBLE,
 x DOUBLE,
 y DOUBLE,
@@ -96,111 +115,190 @@ drs INTEGER
 )
 """)
 
+con.execute("""
+CREATE TABLE IF NOT EXISTS qualifying(
+raceId VARCHAR,
+driverId VARCHAR,
+q1 DOUBLE,
+q2 DOUBLE,
+q3 DOUBLE,
+position INTEGER
+)
+""")
+
 # ----------------------
-# MAIN LOOP (SEASONS)
+# MAIN LOOP
 # ----------------------
+
 for SEASON in SEASONS:
 
-    print(f"\n===== LOADING SEASON {SEASON} =====")
+    print(f"\n===== SEASON {SEASON} =====")
 
-    schedule = fastf1.get_event_schedule(SEASON)
+    try:
+        schedule = fastf1.get_event_schedule(SEASON)
+    except Exception as e:
+        print("Schedule error:", e)
+        continue
 
     for _, race in schedule.iterrows():
 
-        race_name = race["EventName"]
         round_number = race["RoundNumber"]
-        race_date = race["EventDate"]
 
-        # skip preseason testing
         if round_number == 0:
             continue
 
-        # skip NaT dates
+        race_date = race["EventDate"]
+
         if pd.isna(race_date):
             continue
-         
-        race_id = f"{SEASON}_{round_number}"
-        
-        # skip future races
-        if race_date > today:
-            print(f"Skipping future race: {race_name}")
+
+        if race_date.tz_localize("UTC") > today:
+            print("Skipping future race:", race["EventName"])
             continue
 
-        existing = con.execute(
-            "SELECT COUNT(*) FROM races WHERE raceId = ?", [race_id]
+        race_id = f"{SEASON}_{round_number}"
+
+        exists = con.execute(
+            "SELECT COUNT(*) FROM races WHERE raceId = ?",
+            [race_id]
         ).fetchone()[0]
 
-        if existing > 0:
-            print(f"Race {race_id} already loaded, skipping.")
+        if exists:
+            print("Already loaded:", race_id)
             continue
 
-        print(f"Loading round {round_number}: {race_name}")
+        print("Loading:", race["EventName"])
+
+        # ----------------------
+        # RACE SESSION
+        # ----------------------
 
         try:
-            session = fastf1.get_session(SEASON, round_number, SESSION_TYPE)
+            session = fastf1.get_session(SEASON, round_number, "R")
             session.load()
         except Exception as e:
-            print(f"Session skipped: {e}")
+            print("Session skipped:", e)
             continue
 
-        laps = session.laps
-        results = session.results
-        drivers = session.drivers
+        laps = session.laps.copy()
+        results = session.results.copy()
 
-        if laps is None or results is None:
-            print("Session has no data yet.")
-            continue
-
-        if laps.empty or results.empty:
-            print("Empty datasets, skipping.")
+        if laps.empty:
             continue
 
         # ----------------------
         # DRIVERS
         # ----------------------
-        drivers_df = pd.DataFrame({"driverId": drivers})
-        drivers_df["driver"] = drivers_df["driverId"]
 
-        team_map = laps[["Driver", "Team"]].drop_duplicates()
-        team_map.columns = ["driverId", "team"]
-
-        drivers_df = drivers_df.merge(team_map, on="driverId", how="left")
+        drivers_df = results[["Abbreviation","FullName"]].drop_duplicates()
+        drivers_df.columns = ["driverId","driver"]
 
         con.register("drivers_df", drivers_df)
 
         con.execute("""
         INSERT INTO drivers
-        SELECT * FROM drivers_df
+        SELECT *
+        FROM drivers_df
         WHERE driverId NOT IN (SELECT driverId FROM drivers)
         """)
 
         # ----------------------
+        # DRIVER RACES
+        # ----------------------
+
+        dr = laps[["Driver","DriverNumber","Team"]].drop_duplicates()
+
+        dr.columns = ["driverId","driver_number","team"]
+        dr["raceId"] = race_id
+
+        dr = dr[[
+        "raceId",
+        "driverId",
+        "driver_number",
+        "team"
+        ]]
+
+        con.register("dr", dr)
+        con.execute("INSERT INTO driver_races SELECT * FROM dr")
+
+        # ----------------------
         # RACES
         # ----------------------
+
         race_df = pd.DataFrame({
-            "raceId":[race_id],
-            "season":[SEASON],
-            "round":[round_number],
-            "circuit":[race_name]
+
+        "raceId":[race_id],
+        "season":[SEASON],
+        "round":[round_number],
+        "gp_name":[race["EventName"]],
+        "location":[race["Location"]],
+        "country":[race["Country"]]
+
         })
 
         con.register("race_df", race_df)
         con.execute("INSERT INTO races SELECT * FROM race_df")
 
         # ----------------------
+        # SECTORS
+        # ----------------------
+
+        try:
+
+            circuit_info = session.get_circuit_info()
+
+            sector_df = pd.DataFrame({
+
+                "raceId":[race_id,race_id,race_id],
+                "sector":[1,2,3],
+                "start_distance":[
+                    0,
+                    circuit_info.sector_1,
+                    circuit_info.sector_2
+                ]
+
+            })
+
+            con.register("sector_df", sector_df)
+            con.execute("INSERT INTO sectors SELECT * FROM sector_df")
+
+        except Exception as e:
+
+            print("Sector data skipped:", e)
+
+        # ----------------------
         # LAPS
         # ----------------------
-        laps_df = laps[["Driver","LapNumber","LapTime","Compound","Stint","Position"]].copy()
+
+        laps_df = laps[[
+            "Driver",
+            "LapNumber",
+            "LapTime",
+            "Compound",
+            "Stint",
+            "Position"
+        ]].copy()
 
         laps_df.columns = [
-            "driverId","lap","lap_time","compound","stint","position"
+            "driverId",
+            "lap",
+            "lap_time",
+            "compound",
+            "stint",
+            "position"
         ]
 
         laps_df["raceId"] = race_id
         laps_df["lap_time"] = laps_df["lap_time"].dt.total_seconds()
 
         laps_df = laps_df[[
-            "raceId","driverId","lap","lap_time","compound","stint","position"
+            "raceId",
+            "driverId",
+            "lap",
+            "lap_time",
+            "compound",
+            "stint",
+            "position"
         ]]
 
         con.register("laps_df", laps_df)
@@ -209,67 +307,74 @@ for SEASON in SEASONS:
         # ----------------------
         # RESULTS
         # ----------------------
-        results_df = results[["Abbreviation","Position","Points"]].copy()
 
-        results_df.columns = ["driverId","position","points"]
+        results_df = results[[
+            "Abbreviation",
+            "Position",
+            "Points"
+        ]]
+
+        results_df.columns = [
+            "driverId",
+            "position",
+            "points"
+        ]
+
         results_df["raceId"] = race_id
 
         results_df = results_df[[
-            "raceId","driverId","position","points"
+            "raceId",
+            "driverId",
+            "position",
+            "points"
         ]]
 
         con.register("results_df", results_df)
         con.execute("INSERT INTO results SELECT * FROM results_df")
 
         # ----------------------
-        # PIT STOPS
-        # ----------------------
-        pit_df = laps[laps["PitOutTime"].notna()][["Driver","LapNumber"]].copy()
-
-        pit_df.columns = ["driverId","lap"]
-        pit_df["raceId"] = race_id
-        pit_df["duration"] = None
-
-        pit_df = pit_df[[
-            "raceId","driverId","lap","duration"
-        ]]
-
-        con.register("pit_df", pit_df)
-        con.execute("INSERT INTO pit_stops SELECT * FROM pit_df")
-
-        # ----------------------
         # TELEMETRY
         # ----------------------
+
         telemetry_rows = []
 
-        for driver in drivers:
+        for driver in session.drivers:
 
             try:
-                driver_laps = laps.pick_drivers(driver)
-                fastest = driver_laps.pick_fastest()
 
-                car_data = fastest.get_car_data().add_distance()
-                pos_data = fastest.get_pos_data()
+                fastest = laps.pick_drivers(driver).pick_fastest()
 
-                cols = ["Speed","Throttle","Brake","RPM","nGear","DRS","Distance"]
+                car = fastest.get_car_data().add_distance().reset_index(drop=True)
+                pos = fastest.get_pos_data().reset_index(drop=True)
 
-                for col in cols:
-                    if col not in car_data.columns:
-                        car_data[col] = pd.NA
-
-                df = car_data[cols].copy()
+                df = car[[
+                    "Time",
+                    "Speed",
+                    "Throttle",
+                    "Brake",
+                    "RPM",
+                    "nGear",
+                    "DRS",
+                    "Distance"
+                ]].copy()
 
                 df.columns = [
-                    "speed","throttle","brake","rpm","gear","drs","distance"
+                    "time",
+                    "speed",
+                    "throttle",
+                    "brake",
+                    "rpm",
+                    "gear",
+                    "drs",
+                    "distance"
                 ]
 
-                pos_df = pos_data[["X","Y"]].copy()
+                df["time"] = df["time"].dt.total_seconds()
+
+                pos_df = pos[["X","Y"]]
                 pos_df.columns = ["x","y"]
 
-                df = df.reset_index(drop=True)
-                pos_df = pos_df.reset_index(drop=True)
-
-                df = pd.concat([df,pos_df], axis=1)
+                df = pd.concat([df,pos_df],axis=1)
 
                 df["driverId"] = driver
                 df["raceId"] = race_id
@@ -277,30 +382,105 @@ for SEASON in SEASONS:
                 telemetry_rows.append(df)
 
             except Exception as e:
-                print(f"Telemetry skipped for {driver}: {e}")
+
+                print("Telemetry skipped:", driver)
 
         if telemetry_rows:
 
             telemetry_df = pd.concat(telemetry_rows)
 
             telemetry_df = telemetry_df[[
-                "raceId","driverId","distance","x","y",
-                "speed","throttle","brake","rpm","gear","drs"
+
+                "raceId",
+                "driverId",
+                "time",
+                "distance",
+                "x",
+                "y",
+                "speed",
+                "throttle",
+                "brake",
+                "rpm",
+                "gear",
+                "drs"
+
             ]]
 
             con.register("telemetry_df", telemetry_df)
             con.execute("INSERT INTO telemetry SELECT * FROM telemetry_df")
 
+        # ----------------------
+        # QUALIFYING
+        # ----------------------
+
+        try:
+
+            quali = fastf1.get_session(SEASON, round_number, "Q")
+            quali.load()
+
+            qres = quali.results[[
+                "Abbreviation",
+                "Q1",
+                "Q2",
+                "Q3",
+                "Position"
+            ]].copy()
+
+            qres.columns = [
+                "driverId",
+                "q1",
+                "q2",
+                "q3",
+                "position"
+            ]
+
+            qres["raceId"] = race_id
+
+            for col in ["q1","q2","q3"]:
+                qres[col] = qres[col].dt.total_seconds()
+
+            qres = qres[[
+
+                "raceId",
+                "driverId",
+                "q1",
+                "q2",
+                "q3",
+                "position"
+
+            ]]
+
+            con.register("qres", qres)
+            con.execute("INSERT INTO qualifying SELECT * FROM qres")
+
+        except Exception as e:
+
+            print("Qualifying skipped")
+
+        time.sleep(2)
+
 # ----------------------
-# DATA CHECK
+# CHECK
 # ----------------------
+
 print("\n===== DATABASE CHECK =====")
 
-tables = ["drivers","races","laps","results","pit_stops","telemetry"]
+tables = [
+"drivers",
+"driver_races",
+"races",
+"sectors",
+"laps",
+"results",
+"pit_stops",
+"telemetry",
+"qualifying"
+]
 
-for table in tables:
-    count = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-    print(f"{table}: {count} rows")
+for t in tables:
+
+    count = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+    print(t, ":", count)
 
 con.close()
 
