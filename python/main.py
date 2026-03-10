@@ -342,41 +342,46 @@ for SEASON in SEASONS:
 
             try:
 
-                fastest = laps.pick_drivers(driver).pick_fastest()
+                driver_laps = laps.pick_drivers(driver)
 
-                car = fastest.get_car_data().add_distance().reset_index(drop=True)
-                pos = fastest.get_pos_data().reset_index(drop=True)
+                if driver_laps.empty:
+                    continue
 
-                df = car[[
-                    "Time",
+                abbr = driver_laps["Driver"].iloc[0]
+
+                fastest_lap = driver_laps.pick_fastest()
+
+                tel = fastest_lap.get_telemetry().copy().reset_index(drop=True)
+
+                tel["time"] = tel["Time"].dt.total_seconds()
+
+                df = tel[[
+                    "Distance",
+                    "X",
+                    "Y",
                     "Speed",
                     "Throttle",
                     "Brake",
                     "RPM",
                     "nGear",
                     "DRS",
-                    "Distance"
-                ]].copy()
+                    "time"
+                ]]
 
                 df.columns = [
-                    "time",
+                    "distance",
+                    "x",
+                    "y",
                     "speed",
                     "throttle",
                     "brake",
                     "rpm",
                     "gear",
                     "drs",
-                    "distance"
+                    "time"
                 ]
 
-                df["time"] = df["time"].dt.total_seconds()
-
-                pos_df = pos[["X","Y"]]
-                pos_df.columns = ["x","y"]
-
-                df = pd.concat([df,pos_df],axis=1)
-
-                df["driverId"] = driver
+                df["driverId"] = abbr
                 df["raceId"] = race_id
 
                 telemetry_rows.append(df)
