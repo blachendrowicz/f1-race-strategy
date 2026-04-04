@@ -4,6 +4,7 @@ import duckdb
 import os
 import datetime
 import time
+import numpy as np
 
 # ----------------------
 # Paths
@@ -333,7 +334,7 @@ for SEASON in SEASONS:
         con.execute("INSERT INTO results SELECT * FROM results_df")
 
         # ----------------------
-        # TELEMETRY
+        # TELEMETRY (INTERPOLATED)
         # ----------------------
 
         telemetry_rows = []
@@ -353,33 +354,32 @@ for SEASON in SEASONS:
 
                 tel = fastest_lap.get_telemetry().copy().reset_index(drop=True)
 
+                # convert time
                 tel["time"] = tel["Time"].dt.total_seconds()
 
-                df = tel[[
-                    "Distance",
-                    "X",
-                    "Y",
-                    "Speed",
-                    "Throttle",
-                    "Brake",
-                    "RPM",
-                    "nGear",
-                    "DRS",
-                    "time"
-                ]]
+                # sort by distance (IMPORTANT)
+                tel = tel.sort_values("Distance").drop_duplicates(subset="Distance")
 
-                df.columns = [
-                    "distance",
-                    "x",
-                    "y",
-                    "speed",
-                    "throttle",
-                    "brake",
-                    "rpm",
-                    "gear",
-                    "drs",
-                    "time"
-                ]
+                dist = tel["Distance"].values
+
+                if len(dist) < 10:
+                    continue
+
+                # wspólna siatka toru (co 5m)
+                grid = np.arange(dist.min(), dist.max(), 5)
+
+                df = pd.DataFrame({
+                    "distance": grid,
+                    "x": np.interp(grid, dist, tel["X"]),
+                    "y": np.interp(grid, dist, tel["Y"]),
+                    "speed": np.interp(grid, dist, tel["Speed"]),
+                    "throttle": np.interp(grid, dist, tel["Throttle"]),
+                    "brake": np.interp(grid, dist, tel["Brake"]),
+                    "rpm": np.interp(grid, dist, tel["RPM"]),
+                    "gear": np.round(np.interp(grid, dist, tel["nGear"])),
+                    "drs": np.interp(grid, dist, tel["DRS"]),
+                    "time": np.interp(grid, dist, tel["time"])
+                })
 
                 df["driverId"] = abbr
                 df["raceId"] = race_id
@@ -390,30 +390,32 @@ for SEASON in SEASONS:
 
                 print("Telemetry skipped:", driver)
 
-        if telemetry_rows:
+            if telemetry_rows:
 
-            telemetry_df = pd.concat(telemetry_rows)
+                telemetry_df = pd.concat(telemetry_rows)
 
-            telemetry_df = telemetry_df[[
+                telemetry_df = telemetry_df[[
 
-                "raceId",
-                "driverId",
-                "time",
-                "distance",
-                "x",
-                "y",
-                "speed",
-                "throttle",
-                "brake",
-                "rpm",
-                "gear",
-                "drs"
+                    "raceId",
+                    "driverId",
+                    "time",
+                    "distance",
+                    "x",
+                    "y",
+                    "speed",
+                    "throttle",
+                    "brake",
+                    "rpm",
+                    "gear",
+                    "drs"
 
-            ]]
+                ]]
 
-            con.register("telemetry_df", telemetry_df)
-            con.execute("INSERT INTO telemetry SELECT * FROM telemetry_df")
+                con.register("telemetry_df", telemetry_df)
+                con.execute("INSERT INTO telemetry SELECT * FROM telemetry_df")
 
+
+           
         # ----------------------
         # QUALIFYING
         # ----------------------
